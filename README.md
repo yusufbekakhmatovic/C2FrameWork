@@ -14,7 +14,6 @@
 </div>
 
 ---
-
 ## 🎯 Overview
 
 Advanced C2 Framework is a full-stack offensive security project demonstrating modern red team techniques with advanced defense evasion capabilities.
